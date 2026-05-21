@@ -1,11 +1,10 @@
 # Data Directory
 
-This directory will hold generated or cached data artifacts for the take-home.
+This directory holds generated artifacts for the take-home task.
 
-Planned contents:
+**Current Architecture:**
+Instead of hardcoding or storing raw CSV files, we extract live 1-hour PV data from the `Renewables.ninja` API during the `python manage.py seed_week` command.
 
-- Renewables.ninja PV extract for Limassol, 200 kW system.
-- Optional generated CSV of the final 15-minute representative week.
-- Notes on any generated data should also be summarized in the root README.
+The fetch dynamically resamples the data to 15-minute intervals, synthesizes a matched hotel load profile, applies the day/night tariff, calculates the battery dispatch, and stores it directly into the SQLite database. 
 
-Do not store secrets here. The Renewables.ninja token belongs in `.env`.
+*No static CSVs are required to run this solution.*

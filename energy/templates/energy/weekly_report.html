@@ -9,16 +9,101 @@
   </head>
   <body>
     <main class="report-shell">
-      <h1>{{ title }}</h1>
-      <p>{{ status }}</p>
+      <header class="report-header">
+        <div>
+          <p class="eyebrow">Limassol hotel BTM battery</p>
+          <h1>{{ title }}</h1>
+        </div>
+        <p class="status">{{ status }}</p>
+      </header>
 
-      <section aria-label="Weekly report metrics">
-        <!-- Will show grid spend, no-battery counterfactual, savings, kWh charged/discharged, and self-consumption. -->
-      </section>
+      {% if has_data %}
+        <section class="period-band" aria-label="Report period">
+          <span>{{ period_start|date:"D d M Y H:i" }}</span>
+          <span>{{ period_end|date:"D d M Y H:i" }}</span>
+          <span>{{ interval_count }} intervals at 15 minutes</span>
+        </section>
 
-      <section aria-label="Battery state of charge chart">
-        <!-- Will render the SoC curve over the representative week. -->
-      </section>
+        <section class="metric-grid" aria-label="Weekly report metrics">
+          <article class="metric">
+            <span class="metric-label">Weekly saving</span>
+            <strong>EUR {{ savings|floatformat:2 }}</strong>
+          </article>
+          <article class="metric">
+            <span class="metric-label">Grid spend with battery</span>
+            <strong>EUR {{ grid_spend_with_battery|floatformat:2 }}</strong>
+          </article>
+          <article class="metric">
+            <span class="metric-label">No-battery counterfactual</span>
+            <strong>EUR {{ grid_spend_without_battery|floatformat:2 }}</strong>
+          </article>
+          <article class="metric">
+            <span class="metric-label">Battery charged</span>
+            <strong>{{ charged_kwh|floatformat:1 }} kWh</strong>
+          </article>
+          <article class="metric">
+            <span class="metric-label">Battery discharged</span>
+            <strong>{{ discharged_kwh|floatformat:1 }} kWh</strong>
+          </article>
+          <article class="metric">
+            <span class="metric-label">Solar self-consumption</span>
+            <strong>{{ solar_self_consumption_pct|floatformat:1 }}%</strong>
+          </article>
+        </section>
+
+        <section class="report-section" aria-label="Battery state of charge chart">
+          <div class="section-heading">
+            <h2>State of Charge</h2>
+            <span>{{ curtailed_solar_kwh|floatformat:1 }} kWh curtailed</span>
+          </div>
+          <div class="chart-frame">
+            {{ soc_chart_svg|safe }}
+          </div>
+        </section>
+
+        <section class="report-section" aria-label="Dispatch schedule">
+          <div class="section-heading">
+            <h2>Dispatch Schedule</h2>
+            <span>First 96 intervals shown</span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th scope="col">Time</th>
+                  <th scope="col">Solar kW</th>
+                  <th scope="col">Load kW</th>
+                  <th scope="col">Price</th>
+                  <th scope="col">Action</th>
+                  <th scope="col">Battery kW</th>
+                  <th scope="col">SoC</th>
+                  <th scope="col">Grid kWh</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for row in dispatch_rows|slice:":96" %}
+                  <tr>
+                    <td>{{ row.timestamp|date:"D H:i" }}</td>
+                    <td>{{ row.solar_kw|floatformat:1 }}</td>
+                    <td>{{ row.load_kw|floatformat:1 }}</td>
+                    <td>EUR {{ row.price|floatformat:2 }}</td>
+                    <td><span class="action action-{{ row.action }}">{{ row.action }}</span></td>
+                    <td>{{ row.battery_power_kw|floatformat:1 }}</td>
+                    <td>{{ row.soc_percent|floatformat:1 }}%</td>
+                    <td>{{ row.grid_to_load_kwh|floatformat:2 }}</td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      {% else %}
+        <section class="empty-state" aria-label="No report data">
+          <h2>No Weekly Data Yet</h2>
+          <p>{{ message }}</p>
+          <code>python manage.py migrate && python manage.py seed_week</code>
+        </section>
+      {% endif %}
     </main>
   </body>
 </html>
