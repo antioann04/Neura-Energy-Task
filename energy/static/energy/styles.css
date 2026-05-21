@@ -1,0 +1,18 @@
+/*
+  Minimal report styling will live here.
+  Keep it quiet and dashboard-like: readable metrics, compact table/chart space,
+  and no visual decoration that distracts from the dispatch result.
+*/
+
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: #172026;
+  background: #f5f7f8;
+}
+
+.report-shell {
+  max-width: 1080px;
+  margin: 0 auto;
+  padding: 32px 20px;
+}

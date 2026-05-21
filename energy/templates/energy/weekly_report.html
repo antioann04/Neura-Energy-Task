@@ -1,0 +1,24 @@
+{% load static %}
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ title }}</title>
+    <link rel="stylesheet" href="{% static 'energy/styles.css' %}">
+  </head>
+  <body>
+    <main class="report-shell">
+      <h1>{{ title }}</h1>
+      <p>{{ status }}</p>
+
+      <section aria-label="Weekly report metrics">
+        <!-- Will show grid spend, no-battery counterfactual, savings, kWh charged/discharged, and self-consumption. -->
+      </section>
+
+      <section aria-label="Battery state of charge chart">
+        <!-- Will render the SoC curve over the representative week. -->
+      </section>
+    </main>
+  </body>
+</html>
