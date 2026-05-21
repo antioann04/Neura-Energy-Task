@@ -10,15 +10,16 @@ from datetime import date, datetime, time, timedelta
 from io import StringIO
 from math import exp
 import os
-from typing import Any
+from typing import Any, cast
 from zoneinfo import ZoneInfo
 
 from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
+import matplotlib.dates as mdates
 from matplotlib.figure import Figure
 import pandas as pd
-import requests
+import requests  # type: ignore[import-untyped]
 
 from energy.domain import (
     BatterySpec,
@@ -34,6 +35,41 @@ DAY_PRICE_EUR_PER_KWH = 0.30
 NIGHT_PRICE_EUR_PER_KWH = 0.15
 DAY_START_HOUR = 9
 DAY_END_HOUR = 23
+
+
+def _model_manager(model: type[Any]) -> Any:
+    """Return Django's dynamic model manager in a static-analyzer-friendly way."""
+    return cast(Any, model).objects
+
+
+def _atomic_transaction() -> Any:
+    """Return Django's transaction context manager with a Pylance-friendly type."""
+    return transaction.atomic()
+
+
+def _interval_id(interval: EnergyInterval) -> int:
+    """Return a persisted interval id from Django's dynamic model attribute."""
+    return int(getattr(cast(Any, interval), "id"))
+
+
+def _interval_timestamp(interval: EnergyInterval) -> datetime:
+    """Return the runtime datetime value stored on an EnergyInterval."""
+    return cast(datetime, cast(Any, interval).timestamp)
+
+
+def _interval_float(interval: EnergyInterval, field_name: str) -> float:
+    """Return a runtime float value from an EnergyInterval field."""
+    return float(getattr(cast(Any, interval), field_name))
+
+
+def _dispatch_float(dispatch: DispatchInterval, field_name: str) -> float:
+    """Return a runtime float value from a DispatchInterval field."""
+    return float(getattr(cast(Any, dispatch), field_name))
+
+
+def _dispatch_action(dispatch: DispatchInterval) -> str:
+    """Return the runtime action string from a DispatchInterval."""
+    return cast(str, cast(Any, dispatch).action)
 
 
 @dataclass(frozen=True)
@@ -63,7 +99,11 @@ class RenewablesNinjaClient:
         session: requests.Session | None = None,
     ) -> None:
         """Create an API client, optionally with an injected session for tests."""
-        self.api_token = api_token or os.getenv("RENEWABLES_NINJA_API_TOKEN", "")
+        self.api_token: str = (
+            api_token
+            if api_token is not None
+            else os.environ.get("RENEWABLES_NINJA_API_TOKEN", "")
+        )
         self.timeout_seconds = timeout_seconds
         self.session = session or requests.Session()
 
@@ -95,13 +135,13 @@ class RenewablesNinjaClient:
 
         # The API returns epoch-millisecond keys. Sorting makes the downstream
         # resampling deterministic even if the JSON object order ever changes.
-        rows = [
-            (
+        rows: list[tuple[pd.Timestamp, float]] = []
+        for timestamp_ms, values in data.items():
+            timestamp = cast(
+                pd.Timestamp,
                 pd.to_datetime(int(timestamp_ms), unit="ms", utc=True),
-                float(values["electricity"]),
             )
-            for timestamp_ms, values in data.items()
-        ]
+            rows.append((timestamp, float(values["electricity"])))
         rows.sort(key=lambda row: row[0])
         series = pd.Series(
             data=[value for _, value in rows],
@@ -146,10 +186,12 @@ class WeeklyInputBuilder:
             start_date=self.solar_request.start_date - timedelta(days=1),
         )
         hourly_utc = self.client.fetch_hourly_pv(api_request)
+        hourly_index = pd.DatetimeIndex(hourly_utc.index)
+        hourly_values = hourly_utc.to_numpy(dtype=float)
         timestamps: list[pd.Timestamp] = []
         values: list[float] = []
 
-        for timestamp_utc, solar_kw in hourly_utc.items():
+        for timestamp_utc, solar_kw in zip(hourly_index, hourly_values, strict=True):
             for step in range(4):
                 timestamp = timestamp_utc + pd.Timedelta(minutes=15 * step)
                 timestamps.append(timestamp.tz_convert(self.local_tz))
@@ -200,32 +242,50 @@ class WeeklyInputBuilder:
     def build_input_frame(self) -> pd.DataFrame:
         """Return the aligned solar, load, and tariff series for the week."""
         solar = self.build_solar_series()
-        load = self.build_load_series(solar.index)
-        tariff = self.build_tariff_series(solar.index)
-        frame = pd.concat([solar, load, tariff], axis=1)
-        if frame.isna().any().any():
+        solar_index = pd.DatetimeIndex(solar.index)
+        load = self.build_load_series(solar_index)
+        tariff = self.build_tariff_series(solar_index)
+        frame = pd.DataFrame(
+            {
+                "solar_kw": solar.to_numpy(dtype=float),
+                "load_kw": load.to_numpy(dtype=float),
+                "grid_price_eur_per_kwh": tariff.to_numpy(dtype=float),
+            },
+            index=solar_index,
+        )
+        if bool(frame.isna().to_numpy().any()):
             raise RuntimeError("Input series are not aligned.")
         return frame
 
     def seed_database(self) -> int:
         """Write the representative week into EnergyInterval rows."""
         frame = self.build_input_frame()
+        timestamps = pd.DatetimeIndex(frame.index)
+        solar_values = frame["solar_kw"].to_numpy(dtype=float)
+        load_values = frame["load_kw"].to_numpy(dtype=float)
+        price_values = frame["grid_price_eur_per_kwh"].to_numpy(dtype=float)
         rows = [
             EnergyInterval(
                 timestamp=timestamp.to_pydatetime(),
-                solar_kw=float(record.solar_kw),
-                load_kw=float(record.load_kw),
-                grid_price_eur_per_kwh=float(record.grid_price_eur_per_kwh),
+                solar_kw=float(solar_kw),
+                load_kw=float(load_kw),
+                grid_price_eur_per_kwh=float(price),
             )
-            for timestamp, record in frame.iterrows()
+            for timestamp, solar_kw, load_kw, price in zip(
+                timestamps,
+                solar_values,
+                load_values,
+                price_values,
+                strict=True,
+            )
         ]
 
-        with transaction.atomic():
+        with _atomic_transaction():
             # Seeding is intentionally idempotent: one command rerun replaces
             # both inputs and dependent dispatch rows as a single transaction.
-            DispatchInterval.objects.all().delete()
-            EnergyInterval.objects.all().delete()
-            EnergyInterval.objects.bulk_create(rows)
+            _model_manager(DispatchInterval).all().delete()
+            _model_manager(EnergyInterval).all().delete()
+            _model_manager(EnergyInterval).bulk_create(rows)
 
         return len(rows)
 
@@ -250,7 +310,7 @@ class WeeklyInputBuilder:
             raise RuntimeError(
                 "Solar series does not cover the requested local representative week."
             )
-        return filtered
+        return cast(pd.Series, filtered)
 
     def _raw_hotel_load_kw(self, timestamp: datetime) -> float:
         """Return the unscaled synthetic hotel load for one local timestamp."""
@@ -265,7 +325,9 @@ class WeeklyInputBuilder:
         guest_morning = self._bell_curve(hour, center=8.0, width=2.0, amplitude=18.0)
         kitchen_lunch = self._bell_curve(hour, center=13.0, width=2.0, amplitude=8.0)
         cooling_peak = self._bell_curve(hour, center=17.5, width=2.3, amplitude=92.0)
-        evening_occupancy = self._bell_curve(hour, center=20.5, width=2.4, amplitude=42.0)
+        evening_occupancy = self._bell_curve(
+            hour, center=20.5, width=2.4, amplitude=42.0
+        )
         operations = 8.0 if 7 <= hour < 24 else 4.0
 
         return (
@@ -278,7 +340,9 @@ class WeeklyInputBuilder:
         ) * weekend_multiplier
 
     @staticmethod
-    def _bell_curve(hour: float, *, center: float, width: float, amplitude: float) -> float:
+    def _bell_curve(
+        hour: float, *, center: float, width: float, amplitude: float
+    ) -> float:
         """Produce a smooth daily load bump around a center hour."""
         distance = min(abs(hour - center), 24 - abs(hour - center))
         return amplitude * exp(-((distance / width) ** 2))
@@ -293,13 +357,19 @@ class DispatchService:
 
     def run_and_store(self) -> list[DispatchDecision]:
         """Read EnergyInterval rows, run policy, and store dispatch decisions."""
-        intervals = list(EnergyInterval.objects.order_by("timestamp"))
+        intervals = cast(
+            list[EnergyInterval],
+            list(_model_manager(EnergyInterval).order_by("timestamp")),
+        )
         inputs = [
             IntervalInput(
-                timestamp=interval.timestamp,
-                solar_kw=interval.solar_kw,
-                load_kw=interval.load_kw,
-                grid_price_eur_per_kwh=interval.grid_price_eur_per_kwh,
+                timestamp=_interval_timestamp(interval),
+                solar_kw=_interval_float(interval, "solar_kw"),
+                load_kw=_interval_float(interval, "load_kw"),
+                grid_price_eur_per_kwh=_interval_float(
+                    interval,
+                    "grid_price_eur_per_kwh",
+                ),
             )
             for interval in intervals
         ]
@@ -319,11 +389,11 @@ class DispatchService:
             for interval, decision in zip(intervals, decisions, strict=True)
         ]
 
-        with transaction.atomic():
+        with _atomic_transaction():
             # Avoid per-row update_or_create loops; this weekly batch is tiny,
             # but bulk replacement keeps the command simple and repeatable.
-            DispatchInterval.objects.all().delete()
-            DispatchInterval.objects.bulk_create(dispatch_rows)
+            _model_manager(DispatchInterval).all().delete()
+            _model_manager(DispatchInterval).bulk_create(dispatch_rows)
 
         return decisions
 
@@ -335,16 +405,24 @@ class WeeklyReportService:
         """Create the report service with the battery spec used for SoC percent."""
         self.battery = battery or BatterySpec()
 
-    def build_context(self) -> dict[str, object]:
+    def build_context(self) -> dict[str, Any]:
         """Return spend, savings, kWh totals, self-consumption, and SoC chart data."""
-        intervals = list(
-            EnergyInterval.objects.select_related("dispatch").order_by("timestamp")
+        intervals = cast(
+            list[EnergyInterval],
+            list(_model_manager(EnergyInterval).order_by("timestamp")),
         )
         if not intervals:
             return {
                 "has_data": False,
                 "message": "No interval data found. Run python manage.py seed_week first.",
             }
+        dispatch_by_interval_id = cast(
+            dict[int, DispatchInterval],
+            _model_manager(DispatchInterval).in_bulk(
+                [_interval_id(interval) for interval in intervals],
+                field_name="interval_id",
+            ),
+        )
 
         dispatch_rows = []
         no_battery_spend = 0.0
@@ -357,47 +435,65 @@ class WeeklyReportService:
         chart_timestamps: list[datetime] = []
         chart_soc_percent: list[float] = []
 
-        # select_related above keeps this loop from doing one query per interval.
+        # Fetch dispatch rows once instead of touching Django's dynamic reverse
+        # relation in a loop; this is clearer to static analyzers and avoids N+1s.
         for interval in intervals:
-            try:
-                dispatch = interval.dispatch
-            except DispatchInterval.DoesNotExist as exc:
-                raise RuntimeError("Dispatch data missing. Run python manage.py seed_week.") from exc
+            dispatch = dispatch_by_interval_id.get(_interval_id(interval))
+            if dispatch is None:
+                raise RuntimeError(
+                    "Dispatch data missing. Run python manage.py seed_week."
+                )
 
-            interval_solar_kwh = interval.solar_kw * INTERVAL_HOURS
-            interval_load_kwh = interval.load_kw * INTERVAL_HOURS
+            interval_solar_kw = _interval_float(interval, "solar_kw")
+            interval_load_kw = _interval_float(interval, "load_kw")
+            price = _interval_float(interval, "grid_price_eur_per_kwh")
+            dispatch_soc_kwh = _dispatch_float(dispatch, "soc_kwh")
+            dispatch_grid_to_load_kwh = _dispatch_float(dispatch, "grid_to_load_kwh")
+            dispatch_solar_to_battery_kwh = _dispatch_float(
+                dispatch,
+                "solar_to_battery_kwh",
+            )
+            dispatch_battery_to_load_kwh = _dispatch_float(
+                dispatch,
+                "battery_to_load_kwh",
+            )
+            dispatch_curtailed_solar_kwh = _dispatch_float(
+                dispatch,
+                "curtailed_solar_kwh",
+            )
+            interval_solar_kwh = interval_solar_kw * INTERVAL_HOURS
+            interval_load_kwh = interval_load_kw * INTERVAL_HOURS
             no_battery_grid_kwh = max(0.0, interval_load_kwh - interval_solar_kwh)
-            price = interval.grid_price_eur_per_kwh
-            local_timestamp = timezone.localtime(interval.timestamp)
-            soc_percent = 100 * dispatch.soc_kwh / self.battery.capacity_kwh
+            local_timestamp = timezone.localtime(_interval_timestamp(interval))
+            soc_percent = 100 * dispatch_soc_kwh / self.battery.capacity_kwh
 
             no_battery_spend += no_battery_grid_kwh * price
-            battery_spend += dispatch.grid_to_load_kwh * price
-            charged_kwh += dispatch.solar_to_battery_kwh
-            discharged_kwh += dispatch.battery_to_load_kwh
+            battery_spend += dispatch_grid_to_load_kwh * price
+            charged_kwh += dispatch_solar_to_battery_kwh
+            discharged_kwh += dispatch_battery_to_load_kwh
             total_pv_kwh += interval_solar_kwh
-            curtailed_kwh += dispatch.curtailed_solar_kwh
+            curtailed_kwh += dispatch_curtailed_solar_kwh
             chart_timestamps.append(local_timestamp)
             chart_soc_percent.append(soc_percent)
             soc_points.append(
                 {
                     "timestamp": local_timestamp.isoformat(),
-                    "soc_kwh": dispatch.soc_kwh,
+                    "soc_kwh": dispatch_soc_kwh,
                     "soc_percent": soc_percent,
                 }
             )
             dispatch_rows.append(
                 {
                     "timestamp": local_timestamp,
-                    "solar_kw": interval.solar_kw,
-                    "load_kw": interval.load_kw,
+                    "solar_kw": interval_solar_kw,
+                    "load_kw": interval_load_kw,
                     "price": price,
-                    "action": dispatch.action,
-                    "battery_power_kw": dispatch.battery_power_kw,
-                    "soc_kwh": dispatch.soc_kwh,
+                    "action": _dispatch_action(dispatch),
+                    "battery_power_kw": _dispatch_float(dispatch, "battery_power_kw"),
+                    "soc_kwh": dispatch_soc_kwh,
                     "soc_percent": soc_percent,
-                    "grid_to_load_kwh": dispatch.grid_to_load_kwh,
-                    "curtailed_solar_kwh": dispatch.curtailed_solar_kwh,
+                    "grid_to_load_kwh": dispatch_grid_to_load_kwh,
+                    "curtailed_solar_kwh": dispatch_curtailed_solar_kwh,
                 }
             )
 
@@ -436,11 +532,14 @@ class WeeklyReportService:
         """Render the SoC curve as inline SVG for the Django template."""
         figure = Figure(figsize=(10, 3.2), dpi=120)
         axis = figure.subplots()
-        axis.plot(timestamps, soc_percent, color="#2166ac", linewidth=1.8)
+        timestamp_numbers = mdates.date2num(timestamps)
+        axis.plot(timestamp_numbers, soc_percent, color="#2166ac", linewidth=1.8)
         axis.set_title("Battery state of charge")
         axis.set_ylabel("SoC (%)")
         axis.set_ylim(0, 100)
         axis.grid(True, color="#d7dde2", linewidth=0.7)
+        axis.xaxis_date()
+        axis.xaxis.set_major_formatter(mdates.DateFormatter("%b %d\n%H:%M"))
         figure.autofmt_xdate()
 
         buffer = StringIO()
