@@ -30,6 +30,7 @@ class GreedyDispatchPolicyTests(SimpleTestCase):
     """Invariant and edge-case coverage for the greedy dispatch policy."""
 
     def setUp(self) -> None:
+        """Create the default battery and policy used by most tests."""
         self.battery = BatterySpec()
         self.policy = GreedyDispatchPolicy(self.battery)
 
@@ -38,6 +39,7 @@ class GreedyDispatchPolicyTests(SimpleTestCase):
         self.assertAlmostEqual(actual, expected, places=places)
 
     def test_battery_defaults_match_pdf_constraints(self) -> None:
+        """Verify battery defaults encode the task's 400 kWh / 200 kW limits."""
         self.assert_close(self.battery.capacity_kwh, 400.0)
         self.assert_close(self.battery.max_power_kw, 200.0)
         self.assert_close(self.battery.min_soc_kwh, 40.0)
@@ -48,6 +50,7 @@ class GreedyDispatchPolicyTests(SimpleTestCase):
         )
 
     def test_invalid_inputs_fail_fast(self) -> None:
+        """Reject impossible physical settings before dispatch runs."""
         with self.assertRaises(ValueError):
             BatterySpec(capacity_kwh=0)
         with self.assertRaises(ValueError):
@@ -62,9 +65,11 @@ class GreedyDispatchPolicyTests(SimpleTestCase):
             GreedyDispatchPolicy(self.battery, initial_soc_fraction=0.99)
 
     def test_empty_week_returns_empty_schedule(self) -> None:
+        """Allow callers to run the policy against no intervals safely."""
         self.assertEqual(self.policy.run_week([]), [])
 
     def test_surplus_solar_serves_load_then_charges_battery(self) -> None:
+        """Confirm PV serves hotel demand before surplus charges the battery."""
         decision = self.policy.run_week(
             [make_interval(0, solar_kw=200, load_kw=80, price=0.30)]
         )[0]
@@ -79,6 +84,7 @@ class GreedyDispatchPolicyTests(SimpleTestCase):
         self.assert_close(decision.soc_kwh, self.battery.min_soc_kwh + expected_stored_kwh)
 
     def test_charge_power_cap_curtails_unusable_solar(self) -> None:
+        """Cap 15-minute charging at 200 kW and curtail remaining surplus PV."""
         decision = self.policy.run_week(
             [make_interval(0, solar_kw=1000, load_kw=0, price=0.30)]
         )[0]
@@ -90,6 +96,7 @@ class GreedyDispatchPolicyTests(SimpleTestCase):
         self.assert_close(decision.battery_power_kw, -200.0)
 
     def test_full_battery_curtails_surplus_without_exporting(self) -> None:
+        """Keep grid export at zero when the battery cannot absorb surplus PV."""
         full_policy = GreedyDispatchPolicy(
             self.battery,
             initial_soc_fraction=self.battery.max_soc_fraction,
@@ -105,6 +112,7 @@ class GreedyDispatchPolicyTests(SimpleTestCase):
         self.assert_close(decision.grid_to_load_kwh, 0.0)
 
     def test_high_price_interval_discharges_after_solar(self) -> None:
+        """Discharge during the expensive tariff window after direct PV use."""
         charged_policy = GreedyDispatchPolicy(self.battery, initial_soc_fraction=0.50)
         decisions = charged_policy.run_week(
             [
@@ -121,6 +129,7 @@ class GreedyDispatchPolicyTests(SimpleTestCase):
         self.assert_close(decision.battery_power_kw, 160.0)
 
     def test_cheapest_price_interval_does_not_discharge(self) -> None:
+        """Preserve stored energy during the lowest available tariff period."""
         charged_policy = GreedyDispatchPolicy(self.battery, initial_soc_fraction=0.50)
         decision = charged_policy.run_week(
             [make_interval(0, solar_kw=0, load_kw=100, price=0.15)]
@@ -132,6 +141,7 @@ class GreedyDispatchPolicyTests(SimpleTestCase):
         self.assert_close(decision.soc_kwh, 200.0)
 
     def test_round_trip_efficiency_is_observable_across_one_cycle(self) -> None:
+        """Confirm one charge/discharge cycle returns roughly 88% of input energy."""
         decisions = self.policy.run_week(
             [
                 make_interval(0, solar_kw=200, load_kw=0, price=0.15),
@@ -146,6 +156,7 @@ class GreedyDispatchPolicyTests(SimpleTestCase):
         self.assert_close(decisions[1].soc_kwh, self.battery.min_soc_kwh)
 
     def test_week_schedule_preserves_energy_and_limits(self) -> None:
+        """Check core accounting invariants across a multi-day dispatch schedule."""
         intervals = []
         for index in range(96 * 2):
             timestamp = START + timedelta(minutes=15 * index)
@@ -191,6 +202,7 @@ class GreedyDispatchPolicyTests(SimpleTestCase):
             )
 
     def test_non_increasing_timestamps_are_rejected(self) -> None:
+        """Reject unsorted intervals because dispatch is stateful over time."""
         with self.assertRaises(ValueError):
             self.policy.run_week(
                 [

@@ -162,6 +162,7 @@ class GreedyDispatchPolicy:
         soc_kwh: float,
         cheap_price: float,
     ) -> tuple[DispatchDecision, float]:
+        """Dispatch one interval and return both the decision and updated SoC."""
         solar_kwh = interval.solar_kw * self.interval_hours
         load_kwh = interval.load_kw * self.interval_hours
         solar_to_load_kwh = min(solar_kwh, load_kwh)
@@ -173,6 +174,8 @@ class GreedyDispatchPolicy:
         battery_power_kw = 0.0
 
         if surplus_solar_kwh > EPSILON:
+            # Solar is free and cannot be exported, so surplus PV always gets
+            # first chance to charge the battery before any curtailment.
             solar_to_battery_kwh, soc_kwh = self._charge_from_surplus(
                 surplus_solar_kwh=surplus_solar_kwh,
                 soc_kwh=soc_kwh,
@@ -184,6 +187,8 @@ class GreedyDispatchPolicy:
             curtailed_solar_kwh = 0.0
             should_discharge = interval.grid_price_eur_per_kwh > cheap_price + EPSILON
             if should_discharge and load_after_solar_kwh > EPSILON:
+                # The greedy policy only spends stored energy during the
+                # expensive tariff window, after direct solar has served load.
                 battery_to_load_kwh, soc_kwh = self._discharge_to_load(
                     load_after_solar_kwh=load_after_solar_kwh,
                     soc_kwh=soc_kwh,
@@ -211,6 +216,7 @@ class GreedyDispatchPolicy:
         surplus_solar_kwh: float,
         soc_kwh: float,
     ) -> tuple[float, float]:
+        """Charge from surplus solar within power and maximum SoC limits."""
         max_by_power_kwh = self.battery.max_power_kw * self.interval_hours
         remaining_capacity_kwh = self.battery.max_soc_kwh - soc_kwh
         max_by_soc_kwh = remaining_capacity_kwh / self.battery.charge_efficiency
@@ -225,6 +231,7 @@ class GreedyDispatchPolicy:
         load_after_solar_kwh: float,
         soc_kwh: float,
     ) -> tuple[float, float]:
+        """Discharge to serve remaining load within power and minimum SoC limits."""
         max_by_power_kwh = self.battery.max_power_kw * self.interval_hours
         usable_soc_kwh = soc_kwh - self.battery.min_soc_kwh
         max_by_soc_kwh = usable_soc_kwh * self.battery.discharge_efficiency
@@ -236,6 +243,7 @@ class GreedyDispatchPolicy:
 
     @classmethod
     def _action_from_power(cls, battery_power_kw: float) -> str:
+        """Convert signed battery power into the report-friendly action label."""
         if battery_power_kw < -EPSILON:
             return cls.CHARGE
         if battery_power_kw > EPSILON:
@@ -244,4 +252,5 @@ class GreedyDispatchPolicy:
 
     @staticmethod
     def _zero_if_tiny(value: float) -> float:
+        """Remove floating-point dust from public accounting values."""
         return 0.0 if abs(value) < EPSILON else value

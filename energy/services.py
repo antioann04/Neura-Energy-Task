@@ -62,6 +62,7 @@ class RenewablesNinjaClient:
         timeout_seconds: int = 30,
         session: requests.Session | None = None,
     ) -> None:
+        """Create an API client, optionally with an injected session for tests."""
         self.api_token = api_token or os.getenv("RENEWABLES_NINJA_API_TOKEN", "")
         self.timeout_seconds = timeout_seconds
         self.session = session or requests.Session()
@@ -92,6 +93,8 @@ class RenewablesNinjaClient:
         if not data:
             raise RuntimeError("Renewables.ninja returned no PV data.")
 
+        # The API returns epoch-millisecond keys. Sorting makes the downstream
+        # resampling deterministic even if the JSON object order ever changes.
         rows = [
             (
                 pd.to_datetime(int(timestamp_ms), unit="ms", utc=True),
@@ -109,6 +112,7 @@ class RenewablesNinjaClient:
         return series
 
     def _headers(self) -> dict[str, str]:
+        """Return token auth headers when a real token is configured."""
         token = self.api_token.strip()
         if not token or token == "replace_me":
             return {}
@@ -124,6 +128,7 @@ class WeeklyInputBuilder:
         client: RenewablesNinjaClient | None = None,
         timezone_name: str | None = None,
     ) -> None:
+        """Create the weekly builder for a specific solar request and timezone."""
         self.solar_request = solar_request or SolarRequest()
         self.client = client or RenewablesNinjaClient()
         self.timezone_name = timezone_name or settings.TIME_ZONE
@@ -216,6 +221,8 @@ class WeeklyInputBuilder:
         ]
 
         with transaction.atomic():
+            # Seeding is intentionally idempotent: one command rerun replaces
+            # both inputs and dependent dispatch rows as a single transaction.
             DispatchInterval.objects.all().delete()
             EnergyInterval.objects.all().delete()
             EnergyInterval.objects.bulk_create(rows)
@@ -223,6 +230,7 @@ class WeeklyInputBuilder:
         return len(rows)
 
     def _default_local_index(self) -> pd.DatetimeIndex:
+        """Return the exact 672 local 15-minute timestamps for the target week."""
         start = datetime.combine(self.solar_request.start_date, time.min).replace(
             tzinfo=self.local_tz
         )
@@ -233,6 +241,7 @@ class WeeklyInputBuilder:
         return pd.date_range(start=start, end=end, freq="15min", inclusive="left")
 
     def _filter_to_local_week(self, series: pd.Series) -> pd.Series:
+        """Trim UTC-origin PV data to the requested Cyprus local calendar week."""
         expected_index = self._default_local_index()
         filtered = series[
             (series.index >= expected_index[0]) & (series.index <= expected_index[-1])
@@ -244,10 +253,14 @@ class WeeklyInputBuilder:
         return filtered
 
     def _raw_hotel_load_kw(self, timestamp: datetime) -> float:
+        """Return the unscaled synthetic hotel load for one local timestamp."""
         local_timestamp = timestamp.astimezone(self.local_tz)
         hour = local_timestamp.hour + (local_timestamp.minute / 60)
         weekend_multiplier = 1.07 if local_timestamp.weekday() in {4, 5, 6} else 1.0
 
+        # Shape assumptions: hotel baseload overnight, breakfast activity,
+        # modest lunch service, cooling peak later in the afternoon, and an
+        # evening occupancy bump. build_load_series scales this to a 200 kW peak.
         overnight_baseload = 45.0
         guest_morning = self._bell_curve(hour, center=8.0, width=2.0, amplitude=18.0)
         kitchen_lunch = self._bell_curve(hour, center=13.0, width=2.0, amplitude=8.0)
@@ -266,6 +279,7 @@ class WeeklyInputBuilder:
 
     @staticmethod
     def _bell_curve(hour: float, *, center: float, width: float, amplitude: float) -> float:
+        """Produce a smooth daily load bump around a center hour."""
         distance = min(abs(hour - center), 24 - abs(hour - center))
         return amplitude * exp(-((distance / width) ** 2))
 
@@ -274,6 +288,7 @@ class DispatchService:
     """Run the dispatch policy and persist DispatchInterval rows."""
 
     def __init__(self, policy: GreedyDispatchPolicy | None = None) -> None:
+        """Create the service with the default greedy policy or a test double."""
         self.policy = policy or GreedyDispatchPolicy(BatterySpec())
 
     def run_and_store(self) -> list[DispatchDecision]:
@@ -305,6 +320,8 @@ class DispatchService:
         ]
 
         with transaction.atomic():
+            # Avoid per-row update_or_create loops; this weekly batch is tiny,
+            # but bulk replacement keeps the command simple and repeatable.
             DispatchInterval.objects.all().delete()
             DispatchInterval.objects.bulk_create(dispatch_rows)
 
@@ -315,6 +332,7 @@ class WeeklyReportService:
     """Compute the numbers required by /reports/weekly/."""
 
     def __init__(self, battery: BatterySpec | None = None) -> None:
+        """Create the report service with the battery spec used for SoC percent."""
         self.battery = battery or BatterySpec()
 
     def build_context(self) -> dict[str, object]:
@@ -339,6 +357,7 @@ class WeeklyReportService:
         chart_timestamps: list[datetime] = []
         chart_soc_percent: list[float] = []
 
+        # select_related above keeps this loop from doing one query per interval.
         for interval in intervals:
             try:
                 dispatch = interval.dispatch
@@ -414,6 +433,7 @@ class WeeklyReportService:
         timestamps: list[datetime],
         soc_percent: list[float],
     ) -> str:
+        """Render the SoC curve as inline SVG for the Django template."""
         figure = Figure(figsize=(10, 3.2), dpi=120)
         axis = figure.subplots()
         axis.plot(timestamps, soc_percent, color="#2166ac", linewidth=1.8)
